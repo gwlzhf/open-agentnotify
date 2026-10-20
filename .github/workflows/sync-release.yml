@@ -1,0 +1,99 @@
+# Mirror the portable packages of gwlzhf/agentnotify (private) into a release of this public repo.
+#
+# One-time setup (repo settings of gwlzhf/open-agentnotify):
+#   1. Create a fine-grained PAT owned by gwlzhf with "Contents: Read" on gwlzhf/agentnotify.
+#   2. Add it as the Actions secret PRIVATE_REPO_TOKEN in this repo.
+#
+# Runs every 6 hours, or manually (Actions -> Sync agentnotify release -> Run workflow).
+# A release that already exists is skipped unless `force` is set, in which case its assets are replaced.
+
+name: Sync agentnotify release
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to sync (empty = latest release)'
+        required: false
+        default: ''
+      force:
+        description: 'Replace assets if the release already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: gwlzhf/agentnotify
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          if [ -n "$TAG_INPUT" ]; then
+            tag="$TAG_INPUT"
+          else
+            tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          echo "Upstream release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the public release exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download portable packages from the private repo
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" -R "$UPSTREAM" -p 'agentnotify-*-portable.zip' -D dist
+          count=$(ls dist/*.zip 2>/dev/null | wc -l)
+          if [ "$count" -ne 4 ]; then
+            echo "Expected 4 portable packages, got $count"
+            exit 1
+          fi
+          gh release view "$TAG" -R "$UPSTREAM" --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          ls -la dist
+
+      - name: Publish to the public release
+        if: steps.exists.outputs.exists == 'false' || inputs.force
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          if [ "${{ steps.exists.outputs.exists }}" = "true" ]; then
+            gh release upload "$TAG" dist/*.zip -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/*.zip -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "agentnotify $TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+      - name: Skip notice
+        if: steps.exists.outputs.exists == 'true' && !inputs.force
+        run: echo "Release ${{ steps.upstream.outputs.tag }} already published; nothing to do."
